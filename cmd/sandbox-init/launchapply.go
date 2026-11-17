@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cyphar/filepath-securejoin"
+	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/kuasar-sandbox/guest-runtime/pkg/guestabi/proto"
 	"github.com/moby/sys/user"
 	"golang.org/x/sys/unix"
@@ -104,7 +104,7 @@ func bindVolumeDir(root, runDir, source, target string) error {
 	return unix.Mount(source, dir, "", unix.MS_BIND, "")
 }
 
-// assembleDataDisk mounts one disk once on its hidden pmem staging directory.
+// assembleDataDisk mounts one disk once on its hidden runtime staging directory.
 func assembleDataDisk(m proto.MountSpec, asm, ext4Options string) error {
 	needed := []string{asm}
 	if m.DiskOverlay {
@@ -115,23 +115,25 @@ func assembleDataDisk(m proto.MountSpec, asm, ext4Options string) error {
 			return fmt.Errorf("disk %d: mountpoint %s missing in runtime erofs (rebuild sandbox-runtime.bundle or reduce boot.disks[])", m.DiskIndex, d)
 		}
 	}
-	for _, dev := range m.DiskDevs {
-		if err := waitForDevice(dev, devicePollTimeout); err != nil {
-			return fmt.Errorf("disk %d wait %s: %w", m.DiskIndex, dev, err)
+	if guestBoot.backend != firecrackerBackend {
+		for _, dev := range m.DiskDevs {
+			if err := waitForDevice(dev, devicePollTimeout); err != nil {
+				return fmt.Errorf("disk %d wait %s: %w", m.DiskIndex, dev, err)
+			}
 		}
 	}
 	if !m.DiskOverlay {
 		// single: the writable ext4 mounted directly at the assembled point.
-		if err := unix.Mount(m.DiskDevs[0], asm, "ext4", 0, ext4Options); err != nil {
+		if err := mountWorkloadBlock(m.DiskDevs[0], asm, "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("disk %d mount ext4 on %s: %w", m.DiskIndex, asm, err)
 		}
 	} else {
 		// overlay: ro erofs base + rw ext4 upper → overlayfs at the assembled point.
 		lower, upper := asm+"-lower", asm+"-upper"
-		if err := unix.Mount(m.DiskDevs[0], lower, "erofs", unix.MS_RDONLY, ""); err != nil {
+		if err := mountWorkloadBlock(m.DiskDevs[0], lower, "erofs", unix.MS_RDONLY, ""); err != nil {
 			return fmt.Errorf("disk %d mount erofs lower: %w", m.DiskIndex, err)
 		}
-		if err := unix.Mount(m.DiskDevs[1], upper, "ext4", 0, ext4Options); err != nil {
+		if err := mountWorkloadBlock(m.DiskDevs[1], upper, "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("disk %d mount ext4 upper: %w", m.DiskIndex, err)
 		}
 		if err := os.MkdirAll(upper+"/upperdir", 0o755); err != nil {

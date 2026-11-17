@@ -3,12 +3,11 @@
 // It runs three phases (docs/guest-abi.md#initialization):
 //  1. Bring up loopback + bind AF_VSOCK :5000 (socket-only, before hello;
 //     the host→guest reverse channel must exist before the host's ping
-//     ticker fires). Then run the launch handshake (dial CID 2:5000 → hello
-//     → recv launch spec) in a goroutine CONCURRENT with the spec-independent
-//     overlay assembly (mount /proc /sys /dev, wait vda/vdb, mount overlay →
-//     /sysroot). The handshake touches no path, so it is safe alongside
-//     the mount chain and the later chroot. After the join: mount /run and
-//     /run/shm, set up volume binds, then MS_MOVE + chroot into the overlay
+//     ticker fires). Mount /proc /sys /dev and validate the boot layout,
+//     then announce runtime readiness and wait for the host's launch spec.
+//     Only after receipt, assemble the workload root (Firecracker first drops
+//     boot-time block caches). Mount /run and /run/shm, set up volume binds,
+//     then MS_MOVE + chroot into the workload root
 //     and mount the post-switch base filesystems (devpts and cgroup v2).
 //  2. Apply the launch spec on the post-switch rootfs: network, tmpfs mounts,
 //     file injection, one-shot init — then set up the app's stdio and send
@@ -185,23 +184,6 @@ func main() {
 // var is adequate.
 var singleDiskRoot bool
 
-// singleDiskFromCmdline reports whether the kernel cmdline selects single-disk
-// mode (sandbox.root.layout=single, set by the host's CHCommand). /proc must be
-// mounted. Absent ⇒ two-disk overlay mode (the default).
-func singleDiskFromCmdline() bool {
-	b, err := os.ReadFile("/proc/cmdline")
-	if err != nil {
-		logf("phase1a: read /proc/cmdline: %v (assuming overlay mode)", err)
-		return false
-	}
-	for _, tok := range strings.Fields(string(b)) {
-		if tok == "sandbox.root.layout=single" {
-			return true
-		}
-	}
-	return false
-}
-
 // phaseBaseRuntime mounts only sandbox-runtime facilities needed before a
 // workload exists. It deliberately does not probe, read, or mount /dev/vd*.
 func phaseBaseRuntime() error {
@@ -221,41 +203,50 @@ func phaseBaseRuntime() error {
 		}
 	}
 
-	singleDiskRoot = singleDiskFromCmdline() // /proc is mounted now
+	cmdline, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return fmt.Errorf("read boot cmdline: %w", err)
+	}
+	guestBoot, err = parseBootCmdline(string(cmdline))
+	if err != nil {
+		return fmt.Errorf("boot cmdline: %w", err)
+	}
+	singleDiskRoot = guestBoot.singleRoot
 	return nil
 }
 
 // phaseWorkloadRoot begins only after host storage commit. It is the first
 // phase that probes or mounts workload block devices.
 func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
+	if err := guestBoot.validateLaunchDisks(spec); err != nil {
+		return err
+	}
 	ext4Options, err := ext4MountOptions(spec.Ext4Discard)
 	if err != nil {
 		return err
 	}
+	base, upper := guestBoot.rootDevices()
 	if singleDiskRoot {
-		logf("phase1a: base mounts done; single-disk mode, waiting for vda")
-		if err := waitForDevice("/dev/vda", devicePollTimeout); err != nil {
-			return fmt.Errorf("wait /dev/vda: %w", err)
-		}
+		logf("phase1a: base mounts done; single-disk mode, waiting for %s", base)
 		// The single root disk is a writable ext4 CoW; mount it directly.
-		if err := unix.Mount("/dev/vda", "/sysroot", "ext4", 0, ext4Options); err != nil {
+		if err := mountWorkloadBlock(base, "/sysroot", "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("mount blk0 (ext4 rw) on /sysroot: %w", err)
 		}
 		logf("phase1a: single-disk root mounted at /sysroot")
 	} else {
-		logf("phase1a: base mounts done; waiting for vda/vdb")
-		if err := waitForDevice("/dev/vda", devicePollTimeout); err != nil {
-			return fmt.Errorf("wait /dev/vda: %w", err)
+		logf("phase1a: base mounts done; waiting for %s/%s", base, upper)
+		// Preserve CH's historical wait-for-both barrier before mounting lower.
+		if guestBoot.backend != firecrackerBackend {
+			for _, dev := range []string{base, upper} {
+				if err := waitForDevice(dev, devicePollTimeout); err != nil {
+					return err
+				}
+			}
 		}
-		if err := waitForDevice("/dev/vdb", devicePollTimeout); err != nil {
-			return fmt.Errorf("wait /dev/vdb: %w", err)
-		}
-		logf("phase1a: vda+vdb present")
-
-		if err := unix.Mount("/dev/vda", "/overlay/lower", "erofs", unix.MS_RDONLY, ""); err != nil {
+		if err := mountWorkloadBlock(base, "/overlay/lower", "erofs", unix.MS_RDONLY, ""); err != nil {
 			return fmt.Errorf("mount blk0 (erofs ro) on /overlay/lower: %w", err)
 		}
-		if err := unix.Mount("/dev/vdb", "/overlay/upper", "ext4", 0, ext4Options); err != nil {
+		if err := mountWorkloadBlock(upper, "/overlay/upper", "ext4", 0, ext4Options); err != nil {
 			return fmt.Errorf("mount blk1 (ext4 rw) on /overlay/upper: %w", err)
 		}
 		if err := os.MkdirAll("/overlay/upper/upperdir", 0o755); err != nil {
@@ -284,11 +275,12 @@ func phaseWorkloadRoot(spec *proto.LaunchSpec) error {
 	}
 
 	// Project the guest-side runtime payload (/opt/sandbox-runtime, shipped in
-	// the pmem rootfs) into the new root. The source lives on the pmem EROFS,
-	// which becomes unreachable after switch-root, so it must be bound into
+	// the runtime rootfs) into the new root. The source lives on read-only EROFS
+	// (pmem for CH, virtio-blk for FC), which becomes unreachable after
+	// switch-root, so it must be bound into
 	// /sysroot HERE — phase1b's MS_MOVE /sysroot → / then carries it into the
 	// new / along the same subtree (exactly like the empty-volume binds). The
-	// bind keeps the pmem inodes referenced after the original mount is hidden;
+	// bind keeps the runtime inodes referenced after the original mount is hidden;
 	// the source is a read-only EROFS, so the bind is inherently read-only.
 	if err := os.MkdirAll("/sysroot/opt/sandbox-runtime", 0o755); err != nil {
 		return fmt.Errorf("mkdir sysroot opt/sandbox-runtime: %w", err)
@@ -429,7 +421,7 @@ func waitForLaunch() (*proto.LaunchSpec, *vsockConn, error) {
 		_ = conn.Close()
 		return nil, nil, err
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true, Ext4DiscardV1: true, DiskMountProjectionV1: true, DiskSlotV1: diskSlotSupported()}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: guestBoot.readyPhase(), InitialLaunchStateV1: true, Ext4DiscardV1: true, DiskMountProjectionV1: true, DiskSlotV1: guestBoot.backend != firecrackerBackend && diskSlotSupported()}); err != nil {
 		return fail(fmt.Errorf("send runtime_ready: %w", err))
 	}
 	msg, err := proto.ReadMessage(conn)
